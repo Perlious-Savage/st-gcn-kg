@@ -6,6 +6,9 @@ from torch.autograd import Variable
 from net.utils.tgcn import ConvTemporalGraphical
 from net.utils.graph import Graph
 
+_BACKBONE_CHANNELS = 256
+
+
 class Model(nn.Module):
     r"""Spatial temporal graph convolutional networks.
 
@@ -15,6 +18,8 @@ class Model(nn.Module):
         graph_args (dict): The arguments for building the graph
         edge_importance_weighting (bool): If ``True``, adds a learnable
             importance weighting to the edges of the graph
+        use_kg (bool): If ``True``, fuse baseline clip features with a
+            body-part KG branch. Default ``False`` preserves vanilla ST-GCN.
         **kwargs (optional): Other parameters for graph convolution units
 
     Shape:
@@ -27,8 +32,13 @@ class Model(nn.Module):
     """
 
     def __init__(self, in_channels, num_class, graph_args,
-                 edge_importance_weighting, **kwargs):
+                 edge_importance_weighting, use_kg=False, **kwargs):
         super().__init__()
+
+        # allow use_kg via model_args dict without a dedicated yaml key
+        use_kg = kwargs.pop('use_kg', use_kg)
+        self.use_kg = use_kg
+        self.num_class = num_class
 
         # load graph
         self.graph = Graph(**graph_args)
@@ -63,53 +73,83 @@ class Model(nn.Module):
         else:
             self.edge_importance = [1] * len(self.st_gcn_networks)
 
-        # fcn for prediction
-        self.fcn = nn.Conv2d(256, num_class, kernel_size=1)
+        # Baseline classifier (vanilla ST-GCN): applied after global pool -> (N, 256, 1, 1)
+        self.fcn = nn.Conv2d(_BACKBONE_CHANNELS, num_class, kernel_size=1)
+
+        # Optional KG branch (only constructed when enabled; keeps old checkpoints loadable)
+        if self.use_kg:
+            from net.body_part import BodyPartAggregator
+            from net.kg_gnn import KG_GNN
+            self.body_part = BodyPartAggregator()
+            self.kg_gnn = KG_GNN(channels=_BACKBONE_CHANNELS)
+            self.fcn_kg = nn.Linear(_BACKBONE_CHANNELS * 2, num_class)
+
+    def _forward_backbone(self, x):
+        """Skeleton input -> ST-GCN stack output (joint-level features).
+
+        Returns:
+            x: (N*M, 256, T', V) after all st_gcn blocks
+            N, M: batch size and max persons (for person pooling)
+        """
+        N, C, T, V, M = x.size()
+        x = x.permute(0, 4, 3, 1, 2).contiguous()
+        x = x.view(N * M, V * C, T)
+        x = self.data_bn(x)
+        x = x.view(N, M, V, C, T)
+        x = x.permute(0, 1, 3, 4, 2).contiguous()
+        x = x.view(N * M, C, T, V)
+
+        for gcn, importance in zip(self.st_gcn_networks, self.edge_importance):
+            x, _ = gcn(x, self.A * importance)
+
+        return x, N, M
+
+    def _pool_person(self, x, N, M):
+        """Global avg pool over time and nodes, then mean over persons M.
+
+        Args:
+            x: (N*M, C, T', S) where S is V (joints) or P (body parts)
+
+        Returns:
+            (N, C, 1, 1) clip-level feature map (vanilla layout for self.fcn)
+        """
+        x = F.avg_pool2d(x, x.size()[2:])
+        return x.view(N, M, -1, 1, 1).mean(dim=1)
 
     def forward(self, x):
+        # Backbone: (N, C_in, T, V, M) -> (N*M, 256, T', V)
+        x, N, M = self._forward_backbone(x)
 
-        # data normalization
-        N, C, T, V, M = x.size()
-        x = x.permute(0, 4, 3, 1, 2).contiguous()
-        x = x.view(N * M, V * C, T)
-        x = self.data_bn(x)
-        x = x.view(N, M, V, C, T)
-        x = x.permute(0, 1, 3, 4, 2).contiguous()
-        x = x.view(N * M, C, T, V)
+        if not self.use_kg:
+            # --- Vanilla ST-GCN (unchanged) ---
+            # (N*M, 256, T', V) -> pool -> (N, 256, 1, 1) -> fcn -> (N, num_class)
+            x = self._pool_person(x, N, M)
+            x = self.fcn(x)
+            return x.view(x.size(0), -1)
 
-        # forwad
-        for gcn, importance in zip(self.st_gcn_networks, self.edge_importance):
-            x, _ = gcn(x, self.A * importance)
+        # --- KG-enhanced path ---
+        # Baseline clip embedding from joint features: (N, 256)
+        base_map = self._pool_person(x, N, M)
+        base_vec = base_map.view(N, _BACKBONE_CHANNELS)
 
-        # global pooling
-        x = F.avg_pool2d(x, x.size()[2:])
-        x = x.view(N, M, -1, 1, 1).mean(dim=1)
+        # Body-part + semantic graph: (N*M, 256, T', V) -> (N*M, 256, T', 6)
+        part_x = self.body_part(x)
+        part_x = self.kg_gnn(part_x)
 
-        # prediction
-        x = self.fcn(x)
-        x = x.view(x.size(0), -1)
+        # KG clip embedding: (N*M, 256, T', 6) -> pool -> (N, 256)
+        kg_vec = self._pool_person(part_x, N, M).view(N, _BACKBONE_CHANNELS)
 
-        return x
+        # Fusion: concat baseline + KG -> (N, 512) -> logits (N, num_class)
+        fused = torch.cat([base_vec, kg_vec], dim=1)
+        return self.fcn_kg(fused)
 
     def extract_feature(self, x):
-
-        # data normalization
-        N, C, T, V, M = x.size()
-        x = x.permute(0, 4, 3, 1, 2).contiguous()
-        x = x.view(N * M, V * C, T)
-        x = self.data_bn(x)
-        x = x.view(N, M, V, C, T)
-        x = x.permute(0, 1, 3, 4, 2).contiguous()
-        x = x.view(N * M, C, T, V)
-
-        # forwad
-        for gcn, importance in zip(self.st_gcn_networks, self.edge_importance):
-            x, _ = gcn(x, self.A * importance)
+        """Joint-level features and per-(t,v) logits (vanilla layout; KG not applied)."""
+        x, N, M = self._forward_backbone(x)
 
         _, c, t, v = x.size()
         feature = x.view(N, M, c, t, v).permute(0, 2, 3, 4, 1)
 
-        # prediction
         x = self.fcn(x)
         output = x.view(N, M, -1, t, v).permute(0, 2, 3, 4, 1)
 
@@ -195,3 +235,29 @@ class st_gcn(nn.Module):
         x = self.tcn(x) + res
 
         return self.relu(x), A
+
+
+if __name__ == '__main__':
+    # Run from repo root:  python -m net.st_gcn
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    graph_args = {'layout': 'ntu-rgb+d', 'strategy': 'spatial'}
+    num_class = 120
+    n, t, v, m = 2, 300, 25, 2
+    x = torch.randn(n, 3, t, v, m, device=device)
+
+    for use_kg in (False, True):
+        model = Model(
+            in_channels=3,
+            num_class=num_class,
+            graph_args=graph_args,
+            edge_importance_weighting=True,
+            use_kg=use_kg,
+            dropout=0.5,
+        ).to(device)
+        model.eval()
+        with torch.no_grad():
+            out = model(x)
+        assert out.shape == (n, num_class), (
+            'use_kg={}: expected ({}, {}), got {}'.format(
+                use_kg, n, num_class, tuple(out.shape)))
+        print('[PASS] use_kg={} output shape {}'.format(use_kg, tuple(out.shape)))
