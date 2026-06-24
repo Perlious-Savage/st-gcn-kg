@@ -8,7 +8,7 @@ Output: (N*M, C, T', P)  — P=6 semantic parts (mean pool over joints per part)
 import torch
 import torch.nn as nn
 
-# NTU RGB+D joint index reference (0-based; official Kinect order in dataset files)
+# NTU RGB+D joint index reference 
 NTU_JOINT_NAMES = (
     'base_spine',      # 0
     'mid_spine',       # 1
