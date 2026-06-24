@@ -72,7 +72,7 @@ class KG_GNN(nn.Module):
         self.register_buffer('adj_norm', adj)
         self.mix = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
 
-    def forward(self, x):
+    def forward(self, x, adj_dynamic=None):
         if x.dim() != 4:
             raise ValueError(
                 'Expected x.ndim == 4 (N, C, T, P), got shape {}'.format(
@@ -86,8 +86,22 @@ class KG_GNN(nn.Module):
             raise ValueError(
                 'Expected P={}, got P={}'.format(self.num_parts, p))
 
-        # Neighbor messages: (N, C, T, P) @ (P, P) -> (N, C, T, P)
-        agg = torch.matmul(x, self.adj_norm)
+        # Safety Guard
+        use_dynamic = False
+        if adj_dynamic is not None:
+            has_nan = torch.isnan(adj_dynamic).any()
+            has_inf = torch.isinf(adj_dynamic).any()
+            adj_var = torch.var(adj_dynamic)
+            if not has_nan and not has_inf and adj_var >= 1e-6:
+                use_dynamic = True
+
+
+        # Neighbor messages:
+        if use_dynamic:
+            agg = torch.einsum('nctp,npq->nctq', x, adj_dynamic)
+        else:
+            agg = torch.matmul(x, self.adj_norm)
+
         return x + self.mix(agg)
 
 

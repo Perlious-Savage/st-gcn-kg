@@ -134,7 +134,18 @@ class Model(nn.Module):
 
         # Body-part + semantic graph: (N*M, 256, T', V) -> (N*M, 256, T', 6)
         part_x = self.body_part(x)
-        part_x = self.kg_gnn(part_x)
+
+        # Compute dynamic adjacency matrix (N*M, 6, 6)
+        n_dyn, c_dyn, t_dyn, p_dyn = part_x.size()
+        part_flat = part_x.permute(0, 2, 1, 3).contiguous().view(n_dyn, t_dyn * c_dyn, p_dyn)
+        part_mean = part_flat.mean(dim=1, keepdim=True)
+        part_centered = part_flat - part_mean
+        part_std = part_centered.norm(dim=1, keepdim=True) + 1e-8
+        part_norm = part_centered / part_std
+        adj_dynamic = torch.bmm(part_norm.transpose(1, 2), part_norm)
+
+
+        part_x = self.kg_gnn(part_x, adj_dynamic)
 
         # KG clip embedding: (N*M, 256, T', 6) -> pool -> (N, 256)
         kg_vec = self._pool_person(part_x, N, M).view(N, _BACKBONE_CHANNELS)
