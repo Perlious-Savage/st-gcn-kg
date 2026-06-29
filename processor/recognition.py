@@ -94,6 +94,47 @@ class REC_Processor(Processor):
             # backward
             self.optimizer.zero_grad()
             loss.backward()
+
+            # Print gradient norms for the first iteration of the first epoch
+            if self.meta_info['epoch'] == 0 and len(loss_value) == 0:
+                print("\n--- DEBUG: Gradient Norms (First Step) ---")
+                
+                # ST-GCN backbone: all parameters in self.model.st_gcn_networks
+                backbone_grads = []
+                for p in self.model.st_gcn_networks.parameters():
+                    if p.grad is not None:
+                        backbone_grads.append(p.grad.data.norm().item())
+                if backbone_grads:
+                    print("ST-GCN backbone grad norm (mean): {:.6f}".format(np.mean(backbone_grads)))
+                else:
+                    print("ST-GCN backbone: No gradients found")
+                    
+                print("BodyPartAggregator: No parameters (non-parametric)")
+                
+                # KG_GNN: all parameters in self.model.kg_gnn
+                kg_gnn_grads = []
+                for p in self.model.kg_gnn.parameters():
+                    if p.grad is not None:
+                        kg_gnn_grads.append(p.grad.data.norm().item())
+                if kg_gnn_grads:
+                    print("KG_GNN grad norm (mean): {:.6f}".format(np.mean(kg_gnn_grads)))
+                else:
+                    print("KG_GNN: No gradients found")
+                    
+                print("Dynamic adjacency parameters: No parameters (non-parametric, computed dynamically)")
+                print("Temporal gate parameters: No parameters (non-parametric, computed dynamically)")
+                
+                # Final classifier: self.model.fcn_kg
+                class_grads = []
+                for p in self.model.fcn_kg.parameters():
+                    if p.grad is not None:
+                        class_grads.append(p.grad.data.norm().item())
+                if class_grads:
+                    print("Final classifier grad norm (mean): {:.6f}".format(np.mean(class_grads)))
+                else:
+                    print("Final classifier: No gradients found")
+                print("-------------------------------------------\n")
+
             self.optimizer.step()
 
             # statistics

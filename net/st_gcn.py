@@ -51,6 +51,8 @@ class Model(nn.Module):
         dynamic_alpha = kwargs.pop('dynamic_alpha', 0.5)
         use_temporal_gate = kwargs.pop('use_temporal_gate', False)
         self.use_temporal_gate = use_temporal_gate
+        clamp_nonnegative = kwargs.pop('clamp_nonnegative', False)
+        use_column_norm = kwargs.pop('use_column_norm', False)
 
         if self.use_temporal_gate:
             kernel = get_gaussian_kernel(kernel_size=9, sigma=3.0)
@@ -100,7 +102,9 @@ class Model(nn.Module):
             self.kg_gnn = KG_GNN(
                 channels=_BACKBONE_CHANNELS,
                 use_dynamic_adj=use_dynamic_adj,
-                dynamic_alpha=dynamic_alpha
+                dynamic_alpha=dynamic_alpha,
+                clamp_nonnegative=clamp_nonnegative,
+                use_column_norm=use_column_norm
             )
             self.fcn_kg = nn.Linear(_BACKBONE_CHANNELS * 2, num_class)
 
@@ -170,12 +174,29 @@ class Model(nn.Module):
             
             # 6. Generate soft weights using softmax along time dimension: (N*M, T')
             temporal_weights = F.softmax(smoothed, dim=-1)
+
+            if getattr(self, '_first_pass_gate', True):
+                self._first_pass_gate = False
+                print("\n--- DEBUG: Temporal Gate (First Pass) ---")
+                print("Shape: {}".format(tuple(temporal_weights.shape)))
+                print("Mean: {:.6f}".format(temporal_weights.mean().item()))
+                print("Std: {:.6f}".format(temporal_weights.std().item()))
+                print("Min: {:.6f}".format(temporal_weights.min().item()))
+                print("Max: {:.6f}".format(temporal_weights.max().item()))
+                eps = 1e-12
+                entropy = -(temporal_weights * torch.log(temporal_weights + eps)).sum(dim=-1).mean()
+                print("Entropy: {:.6f}".format(entropy.item()))
+                pct_gt_05 = (temporal_weights > 0.5).float().mean() * 100
+                pct_lt_001 = (temporal_weights < 0.01).float().mean() * 100
+                print("Percentage of weights > 0.5: {:.2f}%".format(pct_gt_05.item()))
+                print("Percentage of weights < 0.01: {:.2f}%".format(pct_lt_001.item()))
+                print("------------------------------------------\n")
         else:
             temporal_weights = None
 
         # Body-part + semantic graph: (N*M, 256, T', V) -> (N*M, 256, T', 6)
-        part_x = self.body_part(x)
-        part_x = self.kg_gnn(part_x)
+        part_x_before = self.body_part(x)
+        part_x = self.kg_gnn(part_x_before)
 
         if self.use_temporal_gate:
             # Weight body-part features along the time dimension: (N*M, C, T', 6) * (N*M, 1, T', 1)
@@ -192,6 +213,17 @@ class Model(nn.Module):
 
         # Fusion: concat baseline + KG -> (N, 512) -> logits (N, num_class)
         fused = torch.cat([base_vec, kg_vec], dim=1)
+
+        if getattr(self, '_first_pass_feats', True):
+            self._first_pass_feats = False
+            print("\n--- DEBUG: Feature Tensors (First Pass) ---")
+            print("ST-GCN backbone feature mean: {:.6f}, std: {:.6f}".format(x.mean().item(), x.std().item()))
+            print("Body-part feature mean: {:.6f}, std: {:.6f}".format(part_x_before.mean().item(), part_x_before.std().item()))
+            print("KG feature mean: {:.6f}, std: {:.6f}".format(part_x.mean().item(), part_x.std().item()))
+            print("Fusion feature mean: {:.6f}, std: {:.6f}".format(fused.mean().item(), fused.std().item()))
+            print("Classifier input mean: {:.6f}, std: {:.6f}".format(fused.mean().item(), fused.std().item()))
+            print("-------------------------------------------\n")
+
         return self.fcn_kg(fused)
 
     def extract_feature(self, x):

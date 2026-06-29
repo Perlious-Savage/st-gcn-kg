@@ -64,22 +64,19 @@ class KG_GNN(nn.Module):
         - Output: (N, C, T, P)
     """
 
-    def __init__(self, channels=256, num_parts=NUM_PARTS, edges=SEMANTIC_EDGES, use_dynamic_adj=False, dynamic_alpha=0.5):
+    def __init__(self, channels=256, num_parts=NUM_PARTS, edges=SEMANTIC_EDGES, use_dynamic_adj=False, dynamic_alpha=0.5, clamp_nonnegative=False, use_column_norm=False):
         super().__init__()
         self.num_parts = num_parts
         self.channels = channels
         self.use_dynamic_adj = use_dynamic_adj
         self.dynamic_alpha = dynamic_alpha
+        self.clamp_nonnegative = clamp_nonnegative
+        self.use_column_norm = use_column_norm
         adj = build_part_adjacency(num_parts=num_parts, edges=edges)
         self.register_buffer('adj_norm', adj)
         self.mix = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
 
     def forward(self, x):
-        if x.dim() != 4:
-            raise ValueError(
-                'Expected x.ndim == 4 (N, C, T, P), got shape {}'.format(
-                    tuple(x.shape)))
-
         n, c, t, p = x.size()
         if c != self.channels:
             raise ValueError(
@@ -98,14 +95,38 @@ class KG_GNN(nn.Module):
             part_norm = part_centered / part_std
             # Batch matrix multiplication: (N, P, T*C) @ (N, T*C, P) -> (N, P, P)
             adj_dyn = torch.bmm(part_norm.transpose(1, 2), part_norm)
+
+            if self.clamp_nonnegative:
+                adj_dyn = torch.clamp(adj_dyn, min=0.0)
             
             # 2. Fuse with static adjacency matrix:
             # self.adj_norm shape is (P, P). Broadcasts to (N, P, P).
             adj_fused = (1.0 - self.dynamic_alpha) * self.adj_norm + self.dynamic_alpha * adj_dyn
             
-            # Row-normalize to keep feature scales stable (prevent gradient explosion):
-            deg = adj_fused.abs().sum(dim=2, keepdim=True).clamp(min=1.0)
-            adj_fused = adj_fused / deg
+            # Row or Column normalization to keep feature scales stable:
+            if self.use_column_norm:
+                deg = adj_fused.abs().sum(dim=1, keepdim=True).clamp(min=1.0)
+                adj_fused = adj_fused / deg
+            else:
+                deg = adj_fused.abs().sum(dim=2, keepdim=True).clamp(min=1.0)
+                adj_fused = adj_fused / deg
+            
+            if getattr(self, '_first_pass', True):
+                self._first_pass = False
+                print("\n--- DEBUG: Dynamic Adjacency (First Pass) ---")
+                print("Shape: {}".format(tuple(adj_dyn.shape)))
+                print("Mean: {:.6f}".format(adj_dyn.mean().item()))
+                print("Std: {:.6f}".format(adj_dyn.std().item()))
+                print("Min: {:.6f}".format(adj_dyn.min().item()))
+                print("Max: {:.6f}".format(adj_dyn.max().item()))
+                print("Row sums (sample 0): {}".format(adj_fused[0].abs().sum(dim=1).tolist()))
+                print("Column sums (sample 0): {}".format(adj_fused[0].abs().sum(dim=0).tolist()))
+                diag_mask = torch.eye(adj_dyn.size(-1), device=adj_dyn.device).bool()
+                diag_vals = adj_dyn[:, diag_mask]
+                off_diag_vals = adj_dyn[:, ~diag_mask]
+                print("Diagonal mean: {:.6f}".format(diag_vals.mean().item()))
+                print("Off-diagonal mean: {:.6f}".format(off_diag_vals.mean().item()))
+                print("---------------------------------------------\n")
             
             # 3. Message passing: (N, C, T, P) -> permute to (N, C*T, P)
             # (N, C*T, P) @ (N, P, P) -> (N, C*T, P) -> view back to (N, C, T, P)
