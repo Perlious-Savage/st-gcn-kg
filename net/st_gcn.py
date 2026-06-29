@@ -9,6 +9,13 @@ from net.utils.graph import Graph
 _BACKBONE_CHANNELS = 256
 
 
+def get_gaussian_kernel(kernel_size=9, sigma=3.0):
+    coords = torch.arange(kernel_size).float() - (kernel_size - 1) / 2
+    kernel = torch.exp(-coords.pow(2) / (2 * sigma ** 2))
+    kernel = kernel / kernel.sum()
+    return kernel.view(1, 1, -1)
+
+
 class Model(nn.Module):
     r"""Spatial temporal graph convolutional networks.
 
@@ -39,6 +46,15 @@ class Model(nn.Module):
         use_kg = kwargs.pop('use_kg', use_kg)
         self.use_kg = use_kg
         self.num_class = num_class
+
+        use_dynamic_adj = kwargs.pop('use_dynamic_adj', False)
+        dynamic_alpha = kwargs.pop('dynamic_alpha', 0.5)
+        use_temporal_gate = kwargs.pop('use_temporal_gate', False)
+        self.use_temporal_gate = use_temporal_gate
+
+        if self.use_temporal_gate:
+            kernel = get_gaussian_kernel(kernel_size=9, sigma=3.0)
+            self.register_buffer('gaussian_kernel', kernel)
 
         # load graph
         self.graph = Graph(**graph_args)
@@ -81,7 +97,11 @@ class Model(nn.Module):
             from net.body_part import BodyPartAggregator
             from net.kg_gnn import KG_GNN
             self.body_part = BodyPartAggregator()
-            self.kg_gnn = KG_GNN(channels=_BACKBONE_CHANNELS)
+            self.kg_gnn = KG_GNN(
+                channels=_BACKBONE_CHANNELS,
+                use_dynamic_adj=use_dynamic_adj,
+                dynamic_alpha=dynamic_alpha
+            )
             self.fcn_kg = nn.Linear(_BACKBONE_CHANNELS * 2, num_class)
 
     def _forward_backbone(self, x):
@@ -132,23 +152,43 @@ class Model(nn.Module):
         base_map = self._pool_person(x, N, M)
         base_vec = base_map.view(N, _BACKBONE_CHANNELS)
 
+        if self.use_temporal_gate:
+            # 1. Compute velocity (diff along time axis): (N*M, 256, T'-1, V)
+            v = x[:, :, 1:] - x[:, :, :-1]
+            
+            # 2. Compute speeds (RMS over channels with safe epsilon): (N*M, T'-1, V)
+            speeds = torch.sqrt(v.pow(2).mean(dim=1) + 1e-8)
+            
+            # 3. Average over joints V: (N*M, T'-1)
+            energy = speeds.mean(dim=2)
+            
+            # 4. Pad to match original T' sequence length: (N*M, T')
+            energy = F.pad(energy, (1, 0), mode='replicate')
+            
+            # 5. Smooth using Conv1D: input shape (N*M, 1, T') -> output shape (N*M, T')
+            smoothed = F.conv1d(energy.unsqueeze(1), self.gaussian_kernel, padding=4).squeeze(1)
+            
+            # 6. Generate soft weights using softmax along time dimension: (N*M, T')
+            temporal_weights = F.softmax(smoothed, dim=-1)
+        else:
+            temporal_weights = None
+
         # Body-part + semantic graph: (N*M, 256, T', V) -> (N*M, 256, T', 6)
         part_x = self.body_part(x)
+        part_x = self.kg_gnn(part_x)
 
-        # Compute dynamic adjacency matrix (N*M, 6, 6)
-        n_dyn, c_dyn, t_dyn, p_dyn = part_x.size()
-        part_flat = part_x.permute(0, 2, 1, 3).contiguous().view(n_dyn, t_dyn * c_dyn, p_dyn)
-        part_mean = part_flat.mean(dim=1, keepdim=True)
-        part_centered = part_flat - part_mean
-        part_std = part_centered.norm(dim=1, keepdim=True) + 1e-8
-        part_norm = part_centered / part_std
-        adj_dynamic = torch.bmm(part_norm.transpose(1, 2), part_norm)
-
-
-        part_x = self.kg_gnn(part_x, adj_dynamic)
-
-        # KG clip embedding: (N*M, 256, T', 6) -> pool -> (N, 256)
-        kg_vec = self._pool_person(part_x, N, M).view(N, _BACKBONE_CHANNELS)
+        if self.use_temporal_gate:
+            # Weight body-part features along the time dimension: (N*M, C, T', 6) * (N*M, 1, T', 1)
+            part_x_weighted = part_x * temporal_weights.unsqueeze(1).unsqueeze(-1)
+            
+            # Weighted average over time, average over parts:
+            part_x_pooled = part_x_weighted.sum(dim=2, keepdim=True).mean(dim=3, keepdim=True)
+            
+            # Pool over person dimension M: (N, 256)
+            kg_vec = part_x_pooled.view(N, M, -1, 1, 1).mean(dim=1).view(N, _BACKBONE_CHANNELS)
+        else:
+            # KG clip embedding: (N*M, 256, T', 6) -> pool -> (N, 256)
+            kg_vec = self._pool_person(part_x, N, M).view(N, _BACKBONE_CHANNELS)
 
         # Fusion: concat baseline + KG -> (N, 512) -> logits (N, num_class)
         fused = torch.cat([base_vec, kg_vec], dim=1)
@@ -256,19 +296,31 @@ if __name__ == '__main__':
     n, t, v, m = 2, 300, 25, 2
     x = torch.randn(n, 3, t, v, m, device=device)
 
-    for use_kg in (False, True):
+    # Test combinations of use_kg, use_dynamic_adj, and use_temporal_gate
+    test_cases = [
+        (False, False, False),
+        (True, False, False),
+        (True, True, False),
+        (True, False, True),
+        (True, True, True),
+    ]
+
+    for use_kg, use_dynamic_adj, use_temporal_gate in test_cases:
         model = Model(
             in_channels=3,
             num_class=num_class,
             graph_args=graph_args,
             edge_importance_weighting=True,
             use_kg=use_kg,
+            use_dynamic_adj=use_dynamic_adj,
+            use_temporal_gate=use_temporal_gate,
             dropout=0.5,
         ).to(device)
         model.eval()
         with torch.no_grad():
             out = model(x)
         assert out.shape == (n, num_class), (
-            'use_kg={}: expected ({}, {}), got {}'.format(
-                use_kg, n, num_class, tuple(out.shape)))
-        print('[PASS] use_kg={} output shape {}'.format(use_kg, tuple(out.shape)))
+            'use_kg={}, use_dynamic_adj={}, use_temporal_gate={}: expected ({}, {}), got {}'.format(
+                use_kg, use_dynamic_adj, use_temporal_gate, n, num_class, tuple(out.shape)))
+        print('[PASS] use_kg={}, use_dynamic_adj={}, use_temporal_gate={} output shape {}'.format(
+            use_kg, use_dynamic_adj, use_temporal_gate, tuple(out.shape)))

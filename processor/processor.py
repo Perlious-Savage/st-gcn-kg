@@ -18,6 +18,17 @@ from torchlight import import_class
 
 from .io import IO
 
+class WorkerInitFn(object):
+    def __init__(self, seed):
+        self.seed = seed
+
+    def __call__(self, worker_id):
+        worker_seed = self.seed + worker_id
+        np.random.seed(worker_seed)
+        import random
+        random.seed(worker_seed)
+
+
 class Processor(IO):
     """
         Base Processor
@@ -27,11 +38,23 @@ class Processor(IO):
 
         self.load_arg(argv)
         self.init_environment()
+        self.set_seed(self.arg.seed)
         self.load_model()
         self.load_weights()
         self.gpu()
         self.load_data()
         self.load_optimizer()
+
+    def set_seed(self, seed):
+        import random
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        self.io.print_log('Random Seed set to: {} (reproducibility enabled)'.format(seed))
 
     def init_environment(self):
 
@@ -49,21 +72,33 @@ class Processor(IO):
         if 'debug' not in self.arg.train_feeder_args:
             self.arg.train_feeder_args['debug'] = self.arg.debug
         self.data_loader = dict()
+        worker_init_fn = WorkerInitFn(self.arg.seed)
+
+        num_workers = self.arg.num_worker * torchlight.ngpu(self.arg.device)
+
         if self.arg.phase == 'train':
             self.data_loader['train'] = torch.utils.data.DataLoader(
                 dataset=Feeder(**self.arg.train_feeder_args),
                 batch_size=self.arg.batch_size,
                 shuffle=True,
-                num_workers=self.arg.num_worker * torchlight.ngpu(
-                    self.arg.device),
-                drop_last=True)
+                num_workers=num_workers,
+                drop_last=True,
+                worker_init_fn=worker_init_fn,
+                pin_memory=self.arg.pin_memory,
+                persistent_workers=self.arg.persistent_workers if num_workers > 0 else False,
+                prefetch_factor=self.arg.prefetch_factor if num_workers > 0 else None
+            )
         if self.arg.test_feeder_args:
             self.data_loader['test'] = torch.utils.data.DataLoader(
                 dataset=Feeder(**self.arg.test_feeder_args),
                 batch_size=self.arg.test_batch_size,
                 shuffle=False,
-                num_workers=self.arg.num_worker * torchlight.ngpu(
-                    self.arg.device))
+                num_workers=num_workers,
+                worker_init_fn=worker_init_fn,
+                pin_memory=self.arg.pin_memory,
+                persistent_workers=self.arg.persistent_workers if num_workers > 0 else False,
+                prefetch_factor=self.arg.prefetch_factor if num_workers > 0 else None
+            )
 
     def show_epoch_info(self):
         for k, v in self.epoch_info.items():
@@ -165,16 +200,20 @@ class Processor(IO):
         parser.add_argument('--device', type=int, default=0, nargs='+', help='the indexes of GPUs for training or testing')
 
         # visulize and debug
+        parser.add_argument('--seed', type=int, default=1337, help='random seed for reproducibility')
         parser.add_argument('--log_interval', type=int, default=100, help='the interval for printing messages (#iteration)')
         parser.add_argument('--save_interval', type=int, default=10, help='the interval for storing models (#iteration)')
         parser.add_argument('--eval_interval', type=int, default=5, help='the interval for evaluating models (#iteration)')
         parser.add_argument('--save_log', type=str2bool, default=True, help='save logging or not')
         parser.add_argument('--print_log', type=str2bool, default=True, help='print logging or not')
         parser.add_argument('--pavi_log', type=str2bool, default=False, help='logging on pavi or not')
-
+ 
         # feeder
         parser.add_argument('--feeder', default='feeder.feeder', help='data loader will be used')
         parser.add_argument('--num_worker', type=int, default=4, help='the number of worker per gpu for data loader')
+        parser.add_argument('--pin_memory', type=str2bool, default=True, help='use pin_memory in DataLoader')
+        parser.add_argument('--persistent_workers', type=str2bool, default=True, help='use persistent_workers in DataLoader')
+        parser.add_argument('--prefetch_factor', type=int, default=2, help='prefetch_factor in DataLoader')
         parser.add_argument('--train_feeder_args', action=DictAction, default=dict(), help='the arguments of data loader for training')
         parser.add_argument('--test_feeder_args', action=DictAction, default=dict(), help='the arguments of data loader for test')
         parser.add_argument('--batch_size', type=int, default=256, help='training batch size')

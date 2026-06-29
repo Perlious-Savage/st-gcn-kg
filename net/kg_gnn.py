@@ -64,15 +64,17 @@ class KG_GNN(nn.Module):
         - Output: (N, C, T, P)
     """
 
-    def __init__(self, channels=256, num_parts=NUM_PARTS, edges=SEMANTIC_EDGES):
+    def __init__(self, channels=256, num_parts=NUM_PARTS, edges=SEMANTIC_EDGES, use_dynamic_adj=False, dynamic_alpha=0.5):
         super().__init__()
         self.num_parts = num_parts
         self.channels = channels
+        self.use_dynamic_adj = use_dynamic_adj
+        self.dynamic_alpha = dynamic_alpha
         adj = build_part_adjacency(num_parts=num_parts, edges=edges)
         self.register_buffer('adj_norm', adj)
         self.mix = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
 
-    def forward(self, x, adj_dynamic=None):
+    def forward(self, x):
         if x.dim() != 4:
             raise ValueError(
                 'Expected x.ndim == 4 (N, C, T, P), got shape {}'.format(
@@ -86,20 +88,31 @@ class KG_GNN(nn.Module):
             raise ValueError(
                 'Expected P={}, got P={}'.format(self.num_parts, p))
 
-        # Safety Guard
-        use_dynamic = False
-        if adj_dynamic is not None:
-            has_nan = torch.isnan(adj_dynamic).any()
-            has_inf = torch.isinf(adj_dynamic).any()
-            adj_var = torch.var(adj_dynamic)
-            if not has_nan and not has_inf and adj_var >= 1e-6:
-                use_dynamic = True
-
-
-        # Neighbor messages:
-        if use_dynamic:
-            agg = torch.einsum('nctp,npq->nctq', x, adj_dynamic)
+        if self.use_dynamic_adj:
+            # 1. Flatten spatial-temporal channels to compute correlation over (C * T) features
+            # part_flat shape: (N, T * C, P)
+            part_flat = x.permute(0, 2, 1, 3).contiguous().view(n, t * c, p)
+            part_mean = part_flat.mean(dim=1, keepdim=True)
+            part_centered = part_flat - part_mean
+            part_std = torch.sqrt(part_centered.pow(2).sum(dim=1, keepdim=True) + 1e-8)
+            part_norm = part_centered / part_std
+            # Batch matrix multiplication: (N, P, T*C) @ (N, T*C, P) -> (N, P, P)
+            adj_dyn = torch.bmm(part_norm.transpose(1, 2), part_norm)
+            
+            # 2. Fuse with static adjacency matrix:
+            # self.adj_norm shape is (P, P). Broadcasts to (N, P, P).
+            adj_fused = (1.0 - self.dynamic_alpha) * self.adj_norm + self.dynamic_alpha * adj_dyn
+            
+            # Row-normalize to keep feature scales stable (prevent gradient explosion):
+            deg = adj_fused.abs().sum(dim=2, keepdim=True).clamp(min=1.0)
+            adj_fused = adj_fused / deg
+            
+            # 3. Message passing: (N, C, T, P) -> permute to (N, C*T, P)
+            # (N, C*T, P) @ (N, P, P) -> (N, C*T, P) -> view back to (N, C, T, P)
+            x_flat = x.permute(0, 1, 2, 3).contiguous().view(n, c * t, p)
+            agg = torch.bmm(x_flat, adj_fused).view(n, c, t, p)
         else:
+            # Neighbor messages: (N, C, T, P) @ (P, P) -> (N, C, T, P)
             agg = torch.matmul(x, self.adj_norm)
 
         return x + self.mix(agg)
@@ -114,17 +127,19 @@ if __name__ == '__main__':
     x = torch.randn(nm, c, t, p, device=device)
 
     print('Input: ', tuple(x.shape))
-    gnn = KG_GNN(channels=c).to(device)
-    y = gnn(x)
-    print('Output:', tuple(y.shape))
+    for use_dyn in (False, True):
+        print('Testing KG_GNN with use_dynamic_adj={}'.format(use_dyn))
+        gnn = KG_GNN(channels=c, use_dynamic_adj=use_dyn, dynamic_alpha=0.5).to(device)
+        y = gnn(x)
+        print('Output:', tuple(y.shape))
 
-    assert y.shape == x.shape
-    assert y.device == x.device
-    assert torch.isfinite(y).all()
+        assert y.shape == x.shape
+        assert y.device == x.device
+        assert torch.isfinite(y).all()
 
-    x_req = x.detach().clone().requires_grad_(True)
-    y_req = gnn(x_req)
-    y_req.sum().backward()
-    assert x_req.grad is not None and torch.isfinite(x_req.grad).all()
+        x_req = x.detach().clone().requires_grad_(True)
+        y_req = gnn(x_req)
+        y_req.sum().backward()
+        assert x_req.grad is not None and torch.isfinite(x_req.grad).all()
 
     print('[PASS] kg_gnn shape, device, autograd OK')

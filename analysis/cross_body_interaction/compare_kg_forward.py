@@ -9,6 +9,7 @@ sys.path.insert(0, REPO_ROOT)
 
 from net.st_gcn import Model
 from net.body_part import PART_NAMES
+from net.kg_gnn import KG_GNN
 from analysis.temporal_segmentation.motion_energy import resolve_data_path
 
 def main():
@@ -51,10 +52,16 @@ def main():
         adj_dynamic = torch.bmm(part_norm.transpose(1, 2), part_norm)
         
         # 4. Message passing under Static KG
-        kg_output_static = model.kg_gnn(part_x, adj_dynamic=None)
+        gnn_static = KG_GNN(channels=256, use_dynamic_adj=False).to(device)
+        gnn_static.load_state_dict(model.kg_gnn.state_dict())
+        gnn_static.eval()
+        kg_output_static = gnn_static(part_x)
         
         # 5. Message passing under Dynamic KG
-        kg_output_dynamic = model.kg_gnn(part_x, adj_dynamic=adj_dynamic)
+        gnn_dynamic = KG_GNN(channels=256, use_dynamic_adj=True, dynamic_alpha=0.5).to(device)
+        gnn_dynamic.load_state_dict(model.kg_gnn.state_dict())
+        gnn_dynamic.eval()
+        kg_output_dynamic = gnn_dynamic(part_x)
         
     # Move to CPU for metrics
     static_np = kg_output_static.cpu().numpy()
