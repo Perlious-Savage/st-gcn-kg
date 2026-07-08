@@ -80,8 +80,11 @@ class Model(nn.Module):
         if self.use_kg:
             from net.body_part import BodyPartAggregator
             from net.kg_gnn import KG_GNN
+            from net.interaction import DynamicBodyInteraction, TemporalEnergyAttention
             self.body_part = BodyPartAggregator()
             self.kg_gnn = KG_GNN(channels=_BACKBONE_CHANNELS)
+            self.dynamic_interaction = DynamicBodyInteraction()
+            self.temporal_attention = TemporalEnergyAttention()
             self.fcn_kg = nn.Linear(_BACKBONE_CHANNELS * 2, num_class)
 
     def _forward_backbone(self, x):
@@ -116,7 +119,32 @@ class Model(nn.Module):
         x = F.avg_pool2d(x, x.size()[2:])
         return x.view(N, M, -1, 1, 1).mean(dim=1)
 
+    def _temporal_weighted_pool(self, x, attn, N, M):
+        """Temporal-attention-weighted pool over time and nodes, then mean over persons.
+
+        Args:
+            x: (N*M, C, T', S) where S is V or P
+            attn: (N*M, T_attn) temporal attention weights
+            N, M: batch size and persons
+
+        Returns:
+            (N, C) clip-level feature vector
+        """
+        nm, c, t, s = x.size()
+        # Adapt attention length to feature time dimension
+        if attn.size(1) != t:
+            attn = torch.nn.functional.interpolate(
+                attn.unsqueeze(1), size=t, mode='linear', align_corners=False
+            ).squeeze(1)
+        # attn: (N*M, T') -> (N*M, 1, T', 1) for broadcasting
+        w = attn.unsqueeze(1).unsqueeze(-1)  # (N*M, 1, T', 1)
+        # Weighted mean over time and spatial dims
+        pooled = (x * w).sum(dim=(2, 3)) / (w.sum(dim=(2, 3)) * s)  # (N*M, C)
+        pooled = pooled.view(N, M, c).mean(dim=1)  # (N, C)
+        return pooled
+
     def forward(self, x):
+        x_raw = x  # save raw skeleton for interaction computation
         # Backbone: (N, C_in, T, V, M) -> (N*M, 256, T', V)
         x, N, M = self._forward_backbone(x)
 
@@ -128,16 +156,20 @@ class Model(nn.Module):
             return x.view(x.size(0), -1)
 
         # --- KG-enhanced path ---
-        # Baseline clip embedding from joint features: (N, 256)
-        base_map = self._pool_person(x, N, M)
-        base_vec = base_map.view(N, _BACKBONE_CHANNELS)
+        # Compute dynamic interaction adjacency from raw skeleton input
+        raw_x = x_raw
+        dyn_adj = self.dynamic_interaction(raw_x)  # (N*M, P, P)
+        temporal_attn = self.temporal_attention(raw_x)  # (N*M, T-1)
 
-        # Body-part + semantic graph: (N*M, 256, T', V) -> (N*M, 256, T', 6)
-        part_x = self.body_part(x)
-        part_x = self.kg_gnn(part_x)
+        # Baseline clip embedding from joint features
+        base_vec = self._temporal_weighted_pool(x, temporal_attn, N, M)  # (N, 256)
 
-        # KG clip embedding: (N*M, 256, T', 6) -> pool -> (N, 256)
-        kg_vec = self._pool_person(part_x, N, M).view(N, _BACKBONE_CHANNELS)
+        # Body-part + semantic graph with dynamic adjacency
+        part_x = self.body_part(x)              # (N*M, 256, T', 6)
+        part_x = self.kg_gnn(part_x, dyn_adj)   # (N*M, 256, T', 6) — dynamic edges
+
+        # KG clip embedding with temporal attention
+        kg_vec = self._temporal_weighted_pool(part_x, temporal_attn, N, M)  # (N, 256)
 
         # Fusion: concat baseline + KG -> (N, 512) -> logits (N, num_class)
         fused = torch.cat([base_vec, kg_vec], dim=1)
