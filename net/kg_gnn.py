@@ -72,15 +72,7 @@ class KG_GNN(nn.Module):
         self.register_buffer('adj_norm', adj)
         self.mix = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
 
-    def forward(self, x, dynamic_adj=None):
-        """Forward pass with optional dynamic adjacency.
-
-        Args:
-            x: Tensor of shape (N, C, T, P).
-            dynamic_adj: Optional tensor of shape (N, P, P) providing a
-                per-sample adjacency matrix.  When *None* (default), the
-                static ``self.adj_norm`` buffer built at init time is used.
-        """
+    def forward(self, x):
         if x.dim() != 4:
             raise ValueError(
                 'Expected x.ndim == 4 (N, C, T, P), got shape {}'.format(
@@ -94,15 +86,8 @@ class KG_GNN(nn.Module):
             raise ValueError(
                 'Expected P={}, got P={}'.format(self.num_parts, p))
 
-        # Neighbor messages
-        if dynamic_adj is not None:
-            # dynamic_adj: (N, P, P) per-sample adjacency
-            # x: (N, C, T, P) — flatten C*T, bmm, reshape
-            n, c, t, p = x.size()
-            x_flat = x.reshape(n, c * t, p)
-            agg = torch.bmm(x_flat, dynamic_adj).reshape(n, c, t, p)
-        else:
-            agg = torch.matmul(x, self.adj_norm)
+        # Neighbor messages: (N, C, T, P) @ (P, P) -> (N, C, T, P)
+        agg = torch.matmul(x, self.adj_norm)
         return x + self.mix(agg)
 
 
