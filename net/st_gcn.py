@@ -40,6 +40,10 @@ class Model(nn.Module):
         self.use_kg = use_kg
         self.num_class = num_class
 
+        # Ablation flags (default True when use_kg is on)
+        self.use_temporal_attention = kwargs.pop('use_temporal_attention', True)
+        self.use_dynamic_adj = kwargs.pop('use_dynamic_adj', True)
+
         # load graph
         self.graph = Graph(**graph_args)
         A = torch.tensor(self.graph.A, dtype=torch.float32, requires_grad=False)
@@ -80,12 +84,15 @@ class Model(nn.Module):
         if self.use_kg:
             from net.body_part import BodyPartAggregator
             from net.kg_gnn import KG_GNN
-            from net.interaction import DynamicBodyInteraction, TemporalEnergyAttention
             self.body_part = BodyPartAggregator()
             self.kg_gnn = KG_GNN(channels=_BACKBONE_CHANNELS)
-            self.dynamic_interaction = DynamicBodyInteraction()
-            self.temporal_attention = TemporalEnergyAttention()
             self.fcn_kg = nn.Linear(_BACKBONE_CHANNELS * 2, num_class)
+            if self.use_dynamic_adj:
+                from net.interaction import DynamicBodyInteraction
+                self.dynamic_interaction = DynamicBodyInteraction()
+            if self.use_temporal_attention:
+                from net.interaction import TemporalEnergyAttention
+                self.temporal_attention = TemporalEnergyAttention()
 
     def _forward_backbone(self, x):
         """Skeleton input -> ST-GCN stack output (joint-level features).
@@ -156,20 +163,33 @@ class Model(nn.Module):
             return x.view(x.size(0), -1)
 
         # --- KG-enhanced path ---
-        # Compute dynamic interaction adjacency from raw skeleton input
         raw_x = x_raw
-        dyn_adj = self.dynamic_interaction(raw_x)  # (N*M, P, P)
-        temporal_attn = self.temporal_attention(raw_x)  # (N*M, T-1)
+
+        # Dynamic adjacency: per-sample interaction or static fallback
+        dyn_adj = None
+        if self.use_dynamic_adj:
+            dyn_adj = self.dynamic_interaction(raw_x)  # (N*M, P, P)
+
+        # Temporal attention: motion-energy weighting or None (use avg pool)
+        temporal_attn = None
+        if self.use_temporal_attention:
+            temporal_attn = self.temporal_attention(raw_x)  # (N*M, T-1)
 
         # Baseline clip embedding from joint features
-        base_vec = self._temporal_weighted_pool(x, temporal_attn, N, M)  # (N, 256)
+        if temporal_attn is not None:
+            base_vec = self._temporal_weighted_pool(x, temporal_attn, N, M)
+        else:
+            base_vec = self._pool_person(x, N, M).view(N, _BACKBONE_CHANNELS)
 
-        # Body-part + semantic graph with dynamic adjacency
-        part_x = self.body_part(x)              # (N*M, 256, T', 6)
-        part_x = self.kg_gnn(part_x, dyn_adj)   # (N*M, 256, T', 6) — dynamic edges
+        # Body-part + semantic graph (dyn_adj=None falls back to static adj in KG_GNN)
+        part_x = self.body_part(x)               # (N*M, 256, T', 6)
+        part_x = self.kg_gnn(part_x, dyn_adj)    # (N*M, 256, T', 6)
 
-        # KG clip embedding with temporal attention
-        kg_vec = self._temporal_weighted_pool(part_x, temporal_attn, N, M)  # (N, 256)
+        # KG clip embedding
+        if temporal_attn is not None:
+            kg_vec = self._temporal_weighted_pool(part_x, temporal_attn, N, M)
+        else:
+            kg_vec = self._pool_person(part_x, N, M).view(N, _BACKBONE_CHANNELS)
 
         # Fusion: concat baseline + KG -> (N, 512) -> logits (N, num_class)
         fused = torch.cat([base_vec, kg_vec], dim=1)
