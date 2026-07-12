@@ -42,6 +42,10 @@ class REC_Processor(Processor):
                                         **(self.arg.model_args))
         self.model.apply(weights_init)
         self.loss = nn.CrossEntropyLoss()
+
+        # AMP mixed precision for A100
+        self.scaler = torch.amp.GradScaler('cuda')
+        torch.backends.cudnn.benchmark = True
         
     def load_optimizer(self):
         if self.arg.optimizer == 'SGD':
@@ -87,14 +91,16 @@ class REC_Processor(Processor):
             data = data.float().to(self.dev)
             label = label.long().to(self.dev)
 
-            # forward
-            output = self.model(data)
-            loss = self.loss(output, label)
+            # forward with AMP
+            with torch.amp.autocast('cuda'):
+                output = self.model(data)
+                loss = self.loss(output, label)
 
-            # backward
+            # backward with GradScaler
             self.optimizer.zero_grad()
-            loss.backward()
-            self.optimizer.step()
+            self.scaler.scale(loss).backward()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
 
             # statistics
             self.iter_info['loss'] = loss.data.item()

@@ -2,7 +2,7 @@ work_dir: /content/drive/MyDrive/st-gcn-project/runs/kg_temponly
 
 # feeder
 feeder: feeder.feeder.Feeder
-num_worker: 0
+num_worker: 4
 
 train_feeder_args:
   data_path: /content/drive/MyDrive/st-gcn-project/datasets/ntu_processed/xsub/train_data.npy
@@ -30,13 +30,13 @@ model_args:
 # optimizer
 weight_decay: 0.0001
 base_lr: 0.1
-step: [10, 50]
+step: [20, 40]
 
 # training
 device: [0]
-batch_size: 16
-test_batch_size: 16
-num_epoch: 10
-save_interval: 1
-eval_interval: 2
+batch_size: 64
+test_batch_size: 128
+num_epoch: 50
+save_interval: 5
+eval_interval: 5
 log_interval: 100
