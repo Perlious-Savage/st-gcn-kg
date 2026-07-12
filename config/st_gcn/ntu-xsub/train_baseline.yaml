@@ -1,4 +1,4 @@
-work_dir: /content/drive/MyDrive/st-gcn-project/runs/ST_GCN
+work_dir: /content/drive/MyDrive/st-gcn-project/runs/baseline
 
 # feeder
 feeder: feeder.feeder.Feeder
@@ -13,12 +13,12 @@ test_feeder_args:
   data_path: /content/drive/MyDrive/st-gcn-project/datasets/ntu_processed/xsub/val_data.npy
   label_path: /content/drive/MyDrive/st-gcn-project/datasets/ntu_processed/xsub/val_label.pkl
 
-# model
+# model — Baseline (vanilla ST-GCN, no KG)
 model: net.st_gcn.Model
 model_args:
   in_channels: 3
   num_class: 120
-  use_kg: True
+  use_kg: False
   dropout: 0.5
   edge_importance_weighting: True
   graph_args:
