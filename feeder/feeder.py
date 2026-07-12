@@ -44,6 +44,8 @@ class Feeder(torch.utils.data.Dataset):
         # load label
         with open(self.label_path, 'rb') as f:
             self.sample_name, self.label = pickle.load(f)
+        
+        self._label_min = np.min(self.label)
 
         # load data
         if mmap:
@@ -65,9 +67,10 @@ class Feeder(torch.utils.data.Dataset):
         # get data
         data_numpy = np.array(self.data[index])
 
-        # 🔥 FIXED LABEL HANDLING (for NTU 120 dataset)
+        # Remap labels to 0-based contiguous range
+        # Raw labels are 60–119 (NTU-120 new classes); map to 0–59
         label = int(self.label[index])
-        label = label - 1   # convert 1–120 → 0–119
+        label = label - self._label_min
 
         # processing
         if self.random_choose:

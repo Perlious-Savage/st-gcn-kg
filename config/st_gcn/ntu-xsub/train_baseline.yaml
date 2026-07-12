@@ -5,19 +5,19 @@ feeder: feeder.feeder.Feeder
 num_worker: 4
 
 train_feeder_args:
-  data_path: /content/drive/MyDrive/st-gcn-project/datasets/ntu_processed/xsub/train_data.npy
-  label_path: /content/drive/MyDrive/st-gcn-project/datasets/ntu_processed/xsub/train_label.pkl
+  data_path: /content/drive/MyDrive/st-gcn-project/datasets/ntu_processed/xsub/val_data.npy
+  label_path: /content/drive/MyDrive/st-gcn-project/datasets/ntu_processed/xsub/val_label.pkl
   debug: False
 
 test_feeder_args:
-  data_path: /content/drive/MyDrive/st-gcn-project/datasets/ntu_processed/xsub/val_data.npy
-  label_path: /content/drive/MyDrive/st-gcn-project/datasets/ntu_processed/xsub/val_label.pkl
+  data_path: /content/drive/MyDrive/st-gcn-project/datasets/ntu_processed/xsub/train_data.npy
+  label_path: /content/drive/MyDrive/st-gcn-project/datasets/ntu_processed/xsub/train_label.pkl
 
 # model — Baseline (vanilla ST-GCN, no KG)
 model: net.st_gcn.Model
 model_args:
   in_channels: 3
-  num_class: 120
+  num_class: 60
   use_kg: False
   dropout: 0.5
   edge_importance_weighting: True

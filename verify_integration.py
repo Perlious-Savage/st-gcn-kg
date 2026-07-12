@@ -24,7 +24,7 @@ configs = [
 
 for use_kg, use_ta, use_da, label in configs:
     kwargs = dict(
-        in_channels=3, num_class=120, graph_args=graph_args,
+        in_channels=3, num_class=60, graph_args=graph_args,
         edge_importance_weighting=True, use_kg=use_kg, dropout=0.5,
     )
     if use_ta is not None:
@@ -37,7 +37,7 @@ for use_kg, use_ta, use_da, label in configs:
     with torch.no_grad():
         out = model(x)
 
-    assert out.shape == (2, 120), f"{label}: expected (2, 120), got {out.shape}"
+    assert out.shape == (2, 60), f"{label}: expected (2, 60), got {out.shape}"
     assert torch.isfinite(out).all(), f"{label}: output contains NaN/Inf!"
 
     # Quick backward check
@@ -60,12 +60,9 @@ if os.path.exists(label_path):
     print(f"\n[LABEL CHECK] {label_path}")
     print(f"  Samples: {len(labels)}")
     print(f"  Label range: {min(labels)} – {max(labels)}")
-    if min(labels) == 0:
-        print("  ⚠️  Labels are 0-indexed! The `label - 1` in feeder.py will SHIFT them wrong.")
-        print("  → Remove line 70 (`label = label - 1`) in feeder/feeder.py")
-    elif min(labels) == 1:
-        print("  ✅ Labels are 1-indexed. The `label - 1` in feeder.py is correct.")
+    if min(labels) == 60:
+        print("  ✅ Labels are 60-indexed. feeder.py dynamic remapping will handle this.")
     else:
-        print(f"  ⚠️  Unexpected label range. Check your data.")
+        print(f"  ⚠️  Unexpected label range. Verify feeder.py handles this correctly.")
 else:
     print(f"\n[LABEL CHECK] {label_path} not found — check path on Colab")
