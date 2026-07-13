@@ -82,13 +82,18 @@ class TemporalEnergyAttention(nn.Module):
         e_padded = F.pad(e_unsqueezed, (pad, pad), mode='reflect')
         smoothed = F.conv1d(e_padded, self.kernel).squeeze(1)  # (N*M, T-1)
         
-        # Normalize to [0, 1] per sample
+        # Normalize to [0, 1] per sample, guarding against zero-motion
+        # (e.g. padding person M=2 in NTU is all zeros -> energy is 0)
         e_min = smoothed.min(dim=1, keepdim=True)[0]
         e_max = smoothed.max(dim=1, keepdim=True)[0]
-        normalized = (smoothed - e_min) / (e_max - e_min + 1e-8)
+        denom = e_max - e_min
+        # If a sample has zero motion (all-zeros skeleton), denom is 0.
+        # Replace with 1.0 so normalized becomes 0.0 (uniform attention).
+        safe_denom = torch.where(denom > 1e-6, denom, torch.ones_like(denom))
+        normalized = (smoothed - e_min) / safe_denom
         
-        # Add baseline of 0.1
-        attn = 0.1 + 0.9 * normalized
+        # Add baseline of 0.5 so even low-motion frames contribute
+        attn = 0.5 + 0.5 * normalized
         
         return attn
 
@@ -103,4 +108,19 @@ if __name__ == '__main__':
     attn = temp_attn(raw_x)
     print("TemporalEnergyAttention output shape:", attn.shape)
     assert attn.shape == (4, 299)
-    print("[PASS]")
+    assert torch.isfinite(attn).all(), "NaN/Inf in normal attention!"
+    print("[PASS] normal input")
+
+    # Test zero-motion (simulates NTU padding person M=2 = all zeros)
+    raw_zero = torch.zeros(2, 3, 300, 25, 2)
+    attn_zero = temp_attn(raw_zero)
+    assert torch.isfinite(attn_zero).all(), "NaN/Inf in zero-motion attention!"
+    print("[PASS] zero-motion input (NaN bug fixed)")
+
+    # Test mixed: person 1 has motion, person 2 is all zeros
+    raw_mixed = torch.randn(2, 3, 300, 25, 2)
+    raw_mixed[:, :, :, :, 1] = 0.0  # person 2 is padding
+    attn_mixed = temp_attn(raw_mixed)
+    assert torch.isfinite(attn_mixed).all(), "NaN/Inf in mixed attention!"
+    print("[PASS] mixed input (real + padding person)")
+

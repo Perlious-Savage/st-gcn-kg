@@ -49,6 +49,34 @@ for use_kg, use_ta, use_da, label in configs:
 
 print("\n[ALL PASS] All 5 ablation configs verified successfully!")
 
+# --- NaN regression test with zero-padded person ---
+print("\n--- NaN regression test (zero-padded person M=2) ---")
+x_padded = torch.randn(2, 3, 300, 25, 2, device=device)
+x_padded[:, :, :, :, 1] = 0.0  # person 2 is all zeros (NTU padding)
+
+for use_kg, use_ta, use_da, label in configs:
+    if not use_kg:
+        continue  # baseline doesn't use temporal attention
+    kwargs = dict(
+        in_channels=3, num_class=60, graph_args=graph_args,
+        edge_importance_weighting=True, use_kg=use_kg, dropout=0.5,
+    )
+    if use_ta is not None:
+        kwargs['use_temporal_attention'] = use_ta
+    if use_da is not None:
+        kwargs['use_dynamic_adj'] = use_da
+
+    model = Model(**kwargs).to(device)
+    model.train()
+    out = model(x_padded)
+    loss = out.sum()
+    loss.backward()
+    has_nan = not torch.isfinite(out).all()
+    print(f"[{'FAIL' if has_nan else 'PASS'}] {label} (zero-padded) -> NaN={has_nan}")
+    assert not has_nan, f"{label}: NaN detected with zero-padded person!"
+
+print("[ALL PASS] NaN regression test passed!")
+
 # --- Label sanity check ---
 import os
 import pickle

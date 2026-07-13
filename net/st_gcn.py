@@ -143,10 +143,13 @@ class Model(nn.Module):
             attn = torch.nn.functional.interpolate(
                 attn.unsqueeze(1), size=t, mode='linear', align_corners=False
             ).squeeze(1)
+        # Replace any NaN in attn (from zero-motion samples) with 1.0
+        attn = torch.nan_to_num(attn, nan=1.0)
         # attn: (N*M, T') -> (N*M, 1, T', 1) for broadcasting
         w = attn.unsqueeze(1).unsqueeze(-1)  # (N*M, 1, T', 1)
         # Weighted mean over time and spatial dims
-        pooled = (x * w).sum(dim=(2, 3)) / (w.sum(dim=(2, 3)) * s)  # (N*M, C)
+        w_sum = w.sum(dim=(2, 3)).clamp(min=1e-6)
+        pooled = (x * w).sum(dim=(2, 3)) / (w_sum * s)  # (N*M, C)
         pooled = pooled.view(N, M, c).mean(dim=1)  # (N, C)
         return pooled
 
